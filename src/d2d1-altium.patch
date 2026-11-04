@@ -1,0 +1,1405 @@
+SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-2.1-or-later
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -221,8 +221,13 @@
+     struct d2d_clip_stack clip_stack;
+ 
+     struct d2d_indexed_objects vertex_buffers;
++    struct d2d_glyph_cache *glyph_cache;
++    ID3D11Buffer *upload_vb, *upload_ib;
++    UINT upload_vb_pos, upload_ib_pos;
+ };
+ 
++void d2d_device_context_destroy_glyph_cache(struct d2d_device_context *context);
++
+ HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
+         const struct d2d_device_context_ops *ops, const D2D1_RENDER_TARGET_PROPERTIES *desc,
+         void **render_target);
+@@ -650,8 +655,15 @@
+     ID3D10Blob *precompiled_shape_ps;
+ 
+     struct d2d_indexed_objects shaders;
++
++    /* The context whose D3D state is currently swapped in, and the application state it replaced.
++     * The application state is restored on EndDraw()/Flush(), rather than after every draw. */
++    struct d2d_device_context *active_context;
++    ID3DDeviceContextState *app_state;
+ };
+ 
++void d2d_device_restore_app_state(struct d2d_device *device);
++
+ struct d2d_device *unsafe_impl_from_ID2D1Device(ID2D1Device1 *iface);
+ HRESULT d2d_device_add_indexed_object(struct d2d_indexed_objects *objects, const GUID *id,
+         IUnknown *object);
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -116,12 +116,31 @@
+     --stack->count;
+ }
+ 
+-static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+-        ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
+-        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++void d2d_device_restore_app_state(struct d2d_device *device)
++{
++    struct d2d_device_context *active = device->active_context;
++    ID3D11DeviceContext1 *context;
++
++    if (!active)
++        return;
++
++    if (active->cs)
++        EnterCriticalSection(active->cs);
++    ID3D11Device1_GetImmediateContext1(active->d3d_device, &context);
++    ID3D11DeviceContext1_SwapDeviceContextState(context, device->app_state, NULL);
++    ID3D11DeviceContext1_Release(context);
++    ID3DDeviceContextState_Release(device->app_state);
++    device->app_state = NULL;
++    device->active_context = NULL;
++    if (active->cs)
++        LeaveCriticalSection(active->cs);
++}
++
++static void d2d_device_context_draw_offset(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
++        ID3D11Buffer *ib, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_offset,
++        unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
+     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
+-    ID3DDeviceContextState *prev_state;
+     ID3D11Device1 *device = render_target->d3d_device;
+     ID3D11DeviceContext1 *context;
+     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
+@@ -140,12 +159,20 @@
+         EnterCriticalSection(render_target->cs);
+ 
+     ID3D11Device1_GetImmediateContext1(device, &context);
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
++    if (render_target->device->active_context != render_target)
++    {
++        if (render_target->device->active_context)
++            ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, NULL);
++        else
++            ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state,
++                    &render_target->device->app_state);
++        render_target->device->active_context = render_target;
++    }
+ 
+     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
+     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, 0);
+-    offset = 0;
++    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, ib_offset);
++    offset = vb_offset;
+     ID3D11DeviceContext1_IASetVertexBuffers(context, 0, 1, &vb, &vb_stride, &offset);
+     ID3D11DeviceContext1_VSSetConstantBuffers(context, 0, 1, &vs_cb);
+     ID3D11DeviceContext1_VSSetShader(context, shape_resources->vs, NULL, 0);
+@@ -189,14 +216,87 @@
+     else
+         ID3D11DeviceContext1_Draw(context, index_count, 0);
+ 
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+     ID3D11DeviceContext1_Release(context);
+-    ID3DDeviceContextState_Release(prev_state);
+ 
+     if (render_target->cs)
+         LeaveCriticalSection(render_target->cs);
+ }
+ 
++static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
++        ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++{
++    d2d_device_context_draw_offset(render_target, shape_type, ib, 0, index_count, vb, 0, vb_stride,
++            brush, opacity_brush);
++}
++
++/* Per-draw geometry data goes into dynamic ring buffers, instead of a new buffer per draw. */
++#define D2D_UPLOAD_BUFFER_SIZE (4 * 1024 * 1024)
++
++static HRESULT d2d_device_context_upload(struct d2d_device_context *context, UINT bind_flags,
++        const void *data, UINT size, ID3D11Buffer **buffer, UINT *offset)
++{
++    BOOL index = bind_flags == D3D11_BIND_INDEX_BUFFER;
++    ID3D11Buffer **ring = index ? &context->upload_ib : &context->upload_vb;
++    UINT *pos = index ? &context->upload_ib_pos : &context->upload_vb_pos;
++    UINT aligned = (size + 15) & ~15u;
++    D3D11_MAP map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
++    D3D11_SUBRESOURCE_DATA buffer_data;
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    ID3D11DeviceContext *d3d_context;
++    D3D11_BUFFER_DESC desc;
++    HRESULT hr;
++
++    desc.MiscFlags = 0;
++    desc.StructureByteStride = 0;
++    desc.BindFlags = bind_flags;
++
++    if (aligned > D2D_UPLOAD_BUFFER_SIZE)
++    {
++        desc.ByteWidth = size;
++        desc.Usage = D3D11_USAGE_DEFAULT;
++        desc.CPUAccessFlags = 0;
++        buffer_data.pSysMem = data;
++        buffer_data.SysMemPitch = 0;
++        buffer_data.SysMemSlicePitch = 0;
++        *offset = 0;
++        return ID3D11Device1_CreateBuffer(context->d3d_device, &desc, &buffer_data, buffer);
++    }
++
++    if (!*ring)
++    {
++        desc.ByteWidth = D2D_UPLOAD_BUFFER_SIZE;
++        desc.Usage = D3D11_USAGE_DYNAMIC;
++        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++        if (FAILED(hr = ID3D11Device1_CreateBuffer(context->d3d_device, &desc, NULL, ring)))
++            return hr;
++        *pos = D2D_UPLOAD_BUFFER_SIZE;
++    }
++
++    if (*pos + aligned > D2D_UPLOAD_BUFFER_SIZE)
++    {
++        map_type = D3D11_MAP_WRITE_DISCARD;
++        *pos = 0;
++    }
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)*ring, 0, map_type, 0, &mapped);
++    if (SUCCEEDED(hr))
++    {
++        memcpy((BYTE *)mapped.pData + *pos, data, size);
++        ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)*ring, 0);
++    }
++    ID3D11DeviceContext_Release(d3d_context);
++    if (FAILED(hr))
++        return hr;
++
++    *offset = *pos;
++    *pos += aligned;
++    *buffer = *ring;
++    ID3D11Buffer_AddRef(*buffer);
++    return S_OK;
++}
++
+ static void d2d_device_context_set_error(struct d2d_device_context *context, HRESULT code)
+ {
+     context->error.code = code;
+@@ -269,7 +369,14 @@
+     {
+         unsigned int i, j, k;
+ 
++        if (context->device && context->device->active_context == context)
++            d2d_device_restore_app_state(context->device);
++        if (context->upload_vb)
++            ID3D11Buffer_Release(context->upload_vb);
++        if (context->upload_ib)
++            ID3D11Buffer_Release(context->upload_ib);
+         d2d_clip_stack_cleanup(&context->clip_stack);
++        d2d_device_context_destroy_glyph_cache(context);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+             IDWriteRenderingParams_Release(context->text_rendering_params);
+@@ -856,6 +963,7 @@
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
++    UINT ib_offset = 0, vb_offset = 0;
+     HRESULT hr;
+ 
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
+@@ -883,7 +991,7 @@
+         buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.faces;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &ib, &ib_offset)))
+         {
+             WARN("Failed to create index buffer, hr %#lx.\n", hr);
+             return;
+@@ -893,14 +1001,14 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.vertices;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+             ID3D11Buffer_Release(ib);
+             return;
+         }
+ 
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
++        d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, ib_offset, 3 * geometry->outline.face_count, vb, vb_offset,
+                 sizeof(*geometry->outline.vertices), brush, NULL);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -913,7 +1021,7 @@
+         buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.bezier_faces;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &ib, &ib_offset)))
+         {
+             WARN("Failed to create curves index buffer, hr %#lx.\n", hr);
+             return;
+@@ -923,15 +1031,15 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.beziers;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
+             ID3D11Buffer_Release(ib);
+             return;
+         }
+ 
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
+-                3 * geometry->outline.bezier_face_count, vb,
++        d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib, ib_offset,
++                3 * geometry->outline.bezier_face_count, vb, vb_offset,
+                 sizeof(*geometry->outline.beziers), brush, NULL);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -944,7 +1052,7 @@
+         buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.arc_faces;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &ib, &ib_offset)))
+         {
+             WARN("Failed to create arcs index buffer, hr %#lx.\n", hr);
+             return;
+@@ -954,7 +1062,7 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.arcs;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create arcs vertex buffer, hr %#lx.\n", hr);
+             ID3D11Buffer_Release(ib);
+@@ -962,8 +1070,8 @@
+         }
+ 
+         if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
+-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
+-                    3 * geometry->outline.arc_face_count, vb,
++            d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib, ib_offset,
++                    3 * geometry->outline.arc_face_count, vb, vb_offset,
+                     sizeof(*geometry->outline.arcs), brush, NULL);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -1016,6 +1124,7 @@
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
++    UINT ib_offset = 0, vb_offset = 0;
+     HRESULT hr;
+ 
+     buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+@@ -1043,7 +1152,7 @@
+         buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+         buffer_data.pSysMem = geometry->fill.faces;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &ib, &ib_offset)))
+         {
+             WARN("Failed to create index buffer, hr %#lx.\n", hr);
+             return;
+@@ -1053,14 +1162,14 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->fill.vertices;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+             ID3D11Buffer_Release(ib);
+             return;
+         }
+ 
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
++        d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, ib_offset, 3 * geometry->fill.face_count, vb, vb_offset,
+                 sizeof(*geometry->fill.vertices), brush, opacity_brush);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -1073,13 +1182,13 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->fill.bezier_vertices;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
+             return;
+         }
+ 
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count, vb,
++        d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_CURVE, NULL, 0, geometry->fill.bezier_vertex_count, vb, vb_offset,
+                 sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -1091,14 +1200,14 @@
+         buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+         buffer_data.pSysMem = geometry->fill.arc_vertices;
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (FAILED(hr = d2d_device_context_upload(render_target, buffer_desc.BindFlags, buffer_data.pSysMem, buffer_desc.ByteWidth, &vb, &vb_offset)))
+         {
+             ERR("Failed to create arc vertex buffer, hr %#lx.\n", hr);
+             return;
+         }
+ 
+         if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
+-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
++            d2d_device_context_draw_offset(render_target, D2D_SHAPE_TYPE_CURVE, NULL, 0, geometry->fill.arc_vertex_count, vb, vb_offset,
+                     sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
+ 
+         ID3D11Buffer_Release(vb);
+@@ -1399,6 +1508,738 @@
+     ID2D1PathGeometry_Release(geometry);
+ }
+ 
++/* Glyph outline cache and rasterizer. Outlines are fetched from dwrite once per font face and glyph,
++ * at a fixed reference size, and rasterized here at the needed scale. This avoids dwrite/FreeType
++ * re-hinting every glyph whenever the scale changes (e.g. while zooming). */
++#define D2D_OUTLINE_REF_EM 1024.0f
++#define D2D_OUTLINE_CACHE_BUCKETS 8192
++#define D2D_OUTLINE_CACHE_MAX_ENTRIES 65536
++
++enum d2d_outline_op_type
++{
++    D2D_OUTLINE_MOVE,
++    D2D_OUTLINE_LINE,
++    D2D_OUTLINE_CUBIC,
++};
++
++struct d2d_outline_op
++{
++    enum d2d_outline_op_type type;
++    D2D1_POINT_2F p[3];
++};
++
++struct d2d_glyph_outline
++{
++    struct d2d_glyph_outline *next;
++    IDWriteFontFace *font_face;
++    UINT16 glyph;
++    BOOL sideways;
++    size_t op_count;
++    struct d2d_outline_op *ops;
++};
++
++static struct d2d_glyph_outline *d2d_outline_cache[D2D_OUTLINE_CACHE_BUCKETS];
++static unsigned int d2d_outline_cache_count;
++static CRITICAL_SECTION d2d_outline_cache_cs;
++static CRITICAL_SECTION_DEBUG d2d_outline_cache_cs_debug =
++{
++    0, 0, &d2d_outline_cache_cs,
++    { &d2d_outline_cache_cs_debug.ProcessLocksList, &d2d_outline_cache_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": d2d_outline_cache_cs") }
++};
++static CRITICAL_SECTION d2d_outline_cache_cs = { &d2d_outline_cache_cs_debug, -1, 0, 0, 0, 0 };
++
++struct d2d_outline_sink
++{
++    IDWriteGeometrySink IDWriteGeometrySink_iface;
++    struct d2d_outline_op *ops;
++    size_t count, size;
++    BOOL failed;
++};
++
++static struct d2d_outline_sink *impl_from_IDWriteGeometrySink(IDWriteGeometrySink *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_outline_sink, IDWriteGeometrySink_iface);
++}
++
++static struct d2d_outline_op *d2d_outline_sink_add(struct d2d_outline_sink *sink)
++{
++    if (sink->failed)
++        return NULL;
++    if (!d2d_array_reserve((void **)&sink->ops, &sink->size, sink->count + 1, sizeof(*sink->ops)))
++    {
++        sink->failed = TRUE;
++        return NULL;
++    }
++    return &sink->ops[sink->count++];
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_outline_sink_QueryInterface(IDWriteGeometrySink *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_ID2D1SimplifiedGeometrySink) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_outline_sink_AddRef(IDWriteGeometrySink *iface)
++{
++    return 2;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_outline_sink_Release(IDWriteGeometrySink *iface)
++{
++    return 1;
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_SetFillMode(IDWriteGeometrySink *iface, D2D1_FILL_MODE mode)
++{
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_SetSegmentFlags(IDWriteGeometrySink *iface, D2D1_PATH_SEGMENT flags)
++{
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_BeginFigure(IDWriteGeometrySink *iface,
++        D2D1_POINT_2F start, D2D1_FIGURE_BEGIN begin)
++{
++    struct d2d_outline_op *op;
++
++    if ((op = d2d_outline_sink_add(impl_from_IDWriteGeometrySink(iface))))
++    {
++        op->type = D2D_OUTLINE_MOVE;
++        op->p[0] = start;
++    }
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_AddLines(IDWriteGeometrySink *iface,
++        const D2D1_POINT_2F *points, UINT32 count)
++{
++    struct d2d_outline_sink *sink = impl_from_IDWriteGeometrySink(iface);
++    struct d2d_outline_op *op;
++    UINT32 i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (!(op = d2d_outline_sink_add(sink)))
++            return;
++        op->type = D2D_OUTLINE_LINE;
++        op->p[0] = points[i];
++    }
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_AddBeziers(IDWriteGeometrySink *iface,
++        const D2D1_BEZIER_SEGMENT *beziers, UINT32 count)
++{
++    struct d2d_outline_sink *sink = impl_from_IDWriteGeometrySink(iface);
++    struct d2d_outline_op *op;
++    UINT32 i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (!(op = d2d_outline_sink_add(sink)))
++            return;
++        op->type = D2D_OUTLINE_CUBIC;
++        op->p[0] = beziers[i].point1;
++        op->p[1] = beziers[i].point2;
++        op->p[2] = beziers[i].point3;
++    }
++}
++
++static void STDMETHODCALLTYPE d2d_outline_sink_EndFigure(IDWriteGeometrySink *iface, D2D1_FIGURE_END end)
++{
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_outline_sink_Close(IDWriteGeometrySink *iface)
++{
++    return S_OK;
++}
++
++static const struct ID2D1SimplifiedGeometrySinkVtbl d2d_outline_sink_vtbl =
++{
++    d2d_outline_sink_QueryInterface,
++    d2d_outline_sink_AddRef,
++    d2d_outline_sink_Release,
++    d2d_outline_sink_SetFillMode,
++    d2d_outline_sink_SetSegmentFlags,
++    d2d_outline_sink_BeginFigure,
++    d2d_outline_sink_AddLines,
++    d2d_outline_sink_AddBeziers,
++    d2d_outline_sink_EndFigure,
++    d2d_outline_sink_Close,
++};
++
++static unsigned int d2d_outline_cache_hash(IDWriteFontFace *font_face, UINT16 glyph, BOOL sideways)
++{
++    UINT_PTR h = (UINT_PTR)font_face;
++
++    h = (h >> 4) * 2654435761u ^ glyph * 40503u ^ sideways;
++    return (unsigned int)(h ^ (h >> 16));
++}
++
++/* Returns a cached outline; outlines are never freed while the cache is below its limit, and the
++ * cache is only cleared under the lock while no lookup is using its result (lookups copy nothing,
++ * so the lock is held by the caller for the whole rasterization). */
++static const struct d2d_glyph_outline *d2d_outline_cache_get(IDWriteFontFace *font_face, UINT16 glyph, BOOL sideways)
++{
++    unsigned int hash = d2d_outline_cache_hash(font_face, glyph, sideways), i;
++    struct d2d_outline_sink sink = {{&d2d_outline_sink_vtbl}};
++    struct d2d_glyph_outline *o, *next;
++    HRESULT hr;
++
++    for (o = d2d_outline_cache[hash % D2D_OUTLINE_CACHE_BUCKETS]; o; o = o->next)
++    {
++        if (o->font_face == font_face && o->glyph == glyph && o->sideways == sideways)
++            return o;
++    }
++
++    if (d2d_outline_cache_count >= D2D_OUTLINE_CACHE_MAX_ENTRIES)
++    {
++        for (i = 0; i < D2D_OUTLINE_CACHE_BUCKETS; ++i)
++        {
++            for (o = d2d_outline_cache[i]; o; o = next)
++            {
++                next = o->next;
++                IDWriteFontFace_Release(o->font_face);
++                free(o->ops);
++                free(o);
++            }
++            d2d_outline_cache[i] = NULL;
++        }
++        d2d_outline_cache_count = 0;
++    }
++
++    hr = IDWriteFontFace_GetGlyphRunOutline(font_face, D2D_OUTLINE_REF_EM, &glyph, NULL, NULL, 1,
++            sideways, FALSE, &sink.IDWriteGeometrySink_iface);
++    if (FAILED(hr) || sink.failed || !(o = calloc(1, sizeof(*o))))
++    {
++        free(sink.ops);
++        return NULL;
++    }
++    o->font_face = font_face;
++    IDWriteFontFace_AddRef(font_face);
++    o->glyph = glyph;
++    o->sideways = sideways;
++    o->op_count = sink.count;
++    o->ops = sink.ops;
++    o->next = d2d_outline_cache[hash % D2D_OUTLINE_CACHE_BUCKETS];
++    d2d_outline_cache[hash % D2D_OUTLINE_CACHE_BUCKETS] = o;
++    ++d2d_outline_cache_count;
++    return o;
++}
++
++struct d2d_raster
++{
++    float *acc;
++    int w, h;
++};
++
++/* Signed-area coverage accumulation (as in font-rs). */
++static void d2d_raster_line(struct d2d_raster *r, D2D1_POINT_2F p0, D2D1_POINT_2F p1)
++{
++    float dir, dxdy, x;
++    int y, y0, y1;
++
++    if (fabsf(p0.y - p1.y) <= 1e-6f)
++        return;
++    if (p0.y < p1.y)
++    {
++        dir = 1.0f;
++    }
++    else
++    {
++        D2D1_POINT_2F t = p0;
++        p0 = p1;
++        p1 = t;
++        dir = -1.0f;
++    }
++    dxdy = (p1.x - p0.x) / (p1.y - p0.y);
++    x = p0.x;
++    if (p0.y < 0.0f)
++        x -= p0.y * dxdy;
++    y0 = p0.y < 0.0f ? 0 : (int)p0.y;
++    y1 = min(r->h, (int)ceilf(p1.y));
++
++    for (y = y0; y < y1; ++y)
++    {
++        float *line = r->acc + (size_t)y * r->w;
++        float dy = min((float)(y + 1), p1.y) - max((float)y, p0.y);
++        float xnext = x + dxdy * dy, d = dy * dir;
++        float xa = min(x, xnext), xb = max(x, xnext);
++        float xa_floor = floorf(xa), xb_ceil = ceilf(xb);
++        int xai = (int)xa_floor, xbi = (int)xb_ceil;
++
++        if (xai < 0)
++            xai = 0;
++        if (xbi <= xai + 1)
++        {
++            float xmf = 0.5f * (x + xnext) - xa_floor;
++            line[xai] += d - d * xmf;
++            line[xai + 1] += d * xmf;
++        }
++        else
++        {
++            float s = 1.0f / (xb - xa);
++            float xaf = xa - xa_floor;
++            float a0 = 0.5f * s * (1.0f - xaf) * (1.0f - xaf);
++            float xbf = xb - xb_ceil + 1.0f;
++            float am = 0.5f * s * xbf * xbf;
++            int xi;
++
++            line[xai] += d * a0;
++            if (xbi == xai + 2)
++            {
++                line[xai + 1] += d * (1.0f - a0 - am);
++            }
++            else
++            {
++                float a1 = s * (1.5f - xaf), a2;
++
++                line[xai + 1] += d * (a1 - a0);
++                for (xi = xai + 2; xi < xbi - 1; ++xi)
++                    line[xi] += d * s;
++                a2 = a1 + (xbi - xai - 3) * s;
++                line[xbi - 1] += d * (1.0f - a2 - am);
++            }
++            line[xbi] += d * am;
++        }
++        x = xnext;
++    }
++}
++
++struct d2d_flat_path
++{
++    D2D1_POINT_2F *points;
++    size_t count, size;
++    float min_x, min_y, max_x, max_y;
++    BOOL failed;
++};
++
++static void d2d_flat_path_add(struct d2d_flat_path *path, D2D1_POINT_2F p)
++{
++    if (path->failed)
++        return;
++    if (!d2d_array_reserve((void **)&path->points, &path->size, path->count + 1, sizeof(*path->points)))
++    {
++        path->failed = TRUE;
++        return;
++    }
++    path->points[path->count++] = p;
++    path->min_x = min(path->min_x, p.x);
++    path->min_y = min(path->min_y, p.y);
++    path->max_x = max(path->max_x, p.x);
++    path->max_y = max(path->max_y, p.y);
++}
++
++/* Marks the end of a closed figure in the flattened point list. */
++static const D2D1_POINT_2F d2d_flat_path_break = {INFINITY, INFINITY};
++
++static void d2d_flat_path_end_figure(struct d2d_flat_path *path)
++{
++    if (path->failed)
++        return;
++    if (!d2d_array_reserve((void **)&path->points, &path->size, path->count + 1, sizeof(*path->points)))
++    {
++        path->failed = TRUE;
++        return;
++    }
++    path->points[path->count++] = d2d_flat_path_break;
++}
++
++static inline D2D1_POINT_2F d2d_outline_transform(const D2D1_MATRIX_3X2_F *m, float x, float y)
++{
++    D2D1_POINT_2F p;
++
++    p.x = x * m->_11 + y * m->_21 + m->_31;
++    p.y = x * m->_12 + y * m->_22 + m->_32;
++    return p;
++}
++
++static void d2d_flatten_glyph(struct d2d_flat_path *path, const struct d2d_glyph_outline *o,
++        const D2D1_MATRIX_3X2_F *m)
++{
++    D2D1_POINT_2F cur = {0.0f, 0.0f}, c1, c2, c3, p;
++    BOOL open = FALSE;
++    size_t i;
++
++    for (i = 0; i < o->op_count; ++i)
++    {
++        const struct d2d_outline_op *op = &o->ops[i];
++
++        switch (op->type)
++        {
++            case D2D_OUTLINE_MOVE:
++                if (open)
++                    d2d_flat_path_end_figure(path);
++                cur = d2d_outline_transform(m, op->p[0].x, op->p[0].y);
++                d2d_flat_path_add(path, cur);
++                open = TRUE;
++                break;
++
++            case D2D_OUTLINE_LINE:
++                cur = d2d_outline_transform(m, op->p[0].x, op->p[0].y);
++                d2d_flat_path_add(path, cur);
++                break;
++
++            case D2D_OUTLINE_CUBIC:
++            {
++                float ddx1, ddy1, ddx2, ddy2, dd, t;
++                int n, k;
++
++                c1 = d2d_outline_transform(m, op->p[0].x, op->p[0].y);
++                c2 = d2d_outline_transform(m, op->p[1].x, op->p[1].y);
++                c3 = d2d_outline_transform(m, op->p[2].x, op->p[2].y);
++                /* Wang's formula, 0.2 px tolerance. */
++                ddx1 = cur.x - 2.0f * c1.x + c2.x;
++                ddy1 = cur.y - 2.0f * c1.y + c2.y;
++                ddx2 = c1.x - 2.0f * c2.x + c3.x;
++                ddy2 = c1.y - 2.0f * c2.y + c3.y;
++                dd = sqrtf(max(ddx1 * ddx1 + ddy1 * ddy1, ddx2 * ddx2 + ddy2 * ddy2));
++                n = (int)ceilf(sqrtf(0.75f * dd / 0.2f));
++                n = max(1, min(n, 64));
++                for (k = 1; k <= n; ++k)
++                {
++                    float u, a, b, c, d;
++
++                    t = (float)k / n;
++                    u = 1.0f - t;
++                    a = u * u * u;
++                    b = 3.0f * u * u * t;
++                    c = 3.0f * u * t * t;
++                    d = t * t * t;
++                    p.x = a * cur.x + b * c1.x + c * c2.x + d * c3.x;
++                    p.y = a * cur.y + b * c1.y + c * c2.y + d * c3.y;
++                    d2d_flat_path_add(path, p);
++                }
++                cur = c3;
++                break;
++            }
++        }
++    }
++    if (open)
++        d2d_flat_path_end_figure(path);
++}
++
++/* Rasterizes a glyph run into an 8-bit alpha buffer. Returns FALSE if the run can't be handled here,
++ * in which case the caller falls back to dwrite. On success with an empty run, *values is NULL. */
++static BOOL d2d_rasterize_glyph_run(const DWRITE_GLYPH_RUN *run, D2D1_POINT_2F baseline_origin,
++        const D2D1_MATRIX_3X2_F *device_m, DWRITE_MEASURING_MODE measuring_mode,
++        BYTE **values, RECT *bounds)
++{
++    struct d2d_flat_path path = {NULL, 0, 0, INFINITY, INFINITY, -INFINITY, -INFINITY, FALSE};
++    float scale = run->fontEmSize / D2D_OUTLINE_REF_EM, pen = 0.0f, acc_sum;
++    DWRITE_FONT_METRICS font_metrics;
++    struct d2d_raster raster;
++    BOOL ret = FALSE;
++    UINT32 i;
++    int x, y;
++
++    *values = NULL;
++    if (run->isSideways || (run->bidiLevel & 1) || !run->glyphCount)
++        return FALSE;
++    if (!run->glyphAdvances && measuring_mode != DWRITE_MEASURING_MODE_NATURAL)
++        return FALSE;
++
++    if (!run->glyphAdvances)
++        IDWriteFontFace_GetMetrics(run->fontFace, &font_metrics);
++
++    EnterCriticalSection(&d2d_outline_cache_cs);
++    for (i = 0; i < run->glyphCount; ++i)
++    {
++        const struct d2d_glyph_outline *o;
++        D2D1_MATRIX_3X2_F gm;
++        float gx = baseline_origin.x + pen, gy = baseline_origin.y, advance;
++
++        if (run->glyphOffsets)
++        {
++            gx += run->glyphOffsets[i].advanceOffset;
++            gy -= run->glyphOffsets[i].ascenderOffset;
++        }
++
++        if (!(o = d2d_outline_cache_get(run->fontFace, run->glyphIndices[i], FALSE)))
++            goto done;
++
++        /* glyph space -> run space -> device space */
++        gm._11 = scale * device_m->_11;
++        gm._12 = scale * device_m->_12;
++        gm._21 = scale * device_m->_21;
++        gm._22 = scale * device_m->_22;
++        gm._31 = gx * device_m->_11 + gy * device_m->_21 + device_m->_31;
++        gm._32 = gx * device_m->_12 + gy * device_m->_22 + device_m->_32;
++        d2d_flatten_glyph(&path, o, &gm);
++        if (path.failed)
++            goto done;
++
++        if (run->glyphAdvances)
++        {
++            advance = run->glyphAdvances[i];
++        }
++        else
++        {
++            DWRITE_GLYPH_METRICS gmetrics;
++
++            if (FAILED(IDWriteFontFace_GetDesignGlyphMetrics(run->fontFace, &run->glyphIndices[i], 1,
++                    &gmetrics, FALSE)))
++                goto done;
++            advance = gmetrics.advanceWidth * run->fontEmSize / font_metrics.designUnitsPerEm;
++        }
++        pen += advance;
++    }
++    LeaveCriticalSection(&d2d_outline_cache_cs);
++
++    if (!path.count || path.min_x > path.max_x)
++    {
++        SetRectEmpty(bounds);
++        free(path.points);
++        return TRUE;
++    }
++
++    bounds->left = (int)floorf(path.min_x);
++    bounds->top = (int)floorf(path.min_y);
++    bounds->right = (int)ceilf(path.max_x) + 1;
++    bounds->bottom = (int)ceilf(path.max_y) + 1;
++    raster.w = bounds->right - bounds->left;
++    raster.h = bounds->bottom - bounds->top;
++    if (raster.w <= 0 || raster.h <= 0 || (size_t)raster.w * raster.h > 64 * 1024 * 1024)
++    {
++        free(path.points);
++        return FALSE;
++    }
++
++    if (!(raster.acc = calloc((size_t)raster.w * raster.h + raster.w + 2, sizeof(*raster.acc))))
++    {
++        free(path.points);
++        return FALSE;
++    }
++
++    {
++        D2D1_POINT_2F start, prev, p;
++        BOOL have_start = FALSE;
++        size_t k;
++
++        for (k = 0; k < path.count; ++k)
++        {
++            p = path.points[k];
++            if (isinf(p.x))
++            {
++                if (have_start)
++                    d2d_raster_line(&raster, prev, start);
++                have_start = FALSE;
++                continue;
++            }
++            p.x -= bounds->left;
++            p.y -= bounds->top;
++            if (!have_start)
++            {
++                start = prev = p;
++                have_start = TRUE;
++                continue;
++            }
++            d2d_raster_line(&raster, prev, p);
++            prev = p;
++        }
++    }
++    free(path.points);
++
++    if (!(*values = malloc((size_t)raster.w * raster.h)))
++    {
++        free(raster.acc);
++        return FALSE;
++    }
++    acc_sum = 0.0f;
++    for (y = 0; y < raster.h; ++y)
++    {
++        for (x = 0; x < raster.w; ++x)
++        {
++            float a;
++
++            acc_sum += raster.acc[(size_t)y * raster.w + x];
++            a = min(fabsf(acc_sum), 1.0f);
++            (*values)[(size_t)y * raster.w + x] = (BYTE)(a * 255.0f + 0.5f);
++        }
++    }
++    free(raster.acc);
++    return TRUE;
++
++done:
++    LeaveCriticalSection(&d2d_outline_cache_cs);
++    free(path.points);
++    return ret;
++}
++
++/* Cache of rendered glyph-run alpha bitmaps. Redrawing the same text at the same scale (e.g. while
++ * panning) reuses the bitmap instead of re-rasterizing every glyph through dwrite/FreeType. */
++#define D2D_GLYPH_CACHE_BUCKETS 4096
++#define D2D_GLYPH_CACHE_MAX_ENTRIES 32768
++
++struct d2d_glyph_cache_entry
++{
++    struct d2d_glyph_cache_entry *next;
++    unsigned int hash;
++    IDWriteFontFace *font_face;
++    float em_size;
++    BOOL sideways;
++    UINT32 bidi_level;
++    UINT32 count;
++    UINT16 *indices;
++    float *advances;
++    DWRITE_GLYPH_OFFSET *offsets;
++    float m[4];
++    int frac_x, frac_y;
++    DWRITE_RENDERING_MODE rendering_mode;
++    DWRITE_MEASURING_MODE measuring_mode;
++    DWRITE_TEXT_ANTIALIAS_MODE antialias_mode;
++    ID2D1Bitmap *bitmap; /* NULL for an empty run. */
++    RECT bounds; /* Relative to the integer device origin. */
++};
++
++struct d2d_glyph_cache
++{
++    struct d2d_glyph_cache_entry *buckets[D2D_GLYPH_CACHE_BUCKETS];
++    unsigned int entry_count;
++};
++
++static void d2d_glyph_cache_entry_free(struct d2d_glyph_cache_entry *e)
++{
++    if (e->bitmap)
++        ID2D1Bitmap_Release(e->bitmap);
++    IDWriteFontFace_Release(e->font_face);
++    free(e->indices);
++    free(e->advances);
++    free(e->offsets);
++    free(e);
++}
++
++static void d2d_glyph_cache_clear(struct d2d_glyph_cache *cache)
++{
++    struct d2d_glyph_cache_entry *e, *next;
++    unsigned int i;
++
++    for (i = 0; i < D2D_GLYPH_CACHE_BUCKETS; ++i)
++    {
++        for (e = cache->buckets[i]; e; e = next)
++        {
++            next = e->next;
++            d2d_glyph_cache_entry_free(e);
++        }
++        cache->buckets[i] = NULL;
++    }
++    cache->entry_count = 0;
++}
++
++void d2d_device_context_destroy_glyph_cache(struct d2d_device_context *context)
++{
++    if (!context->glyph_cache)
++        return;
++    d2d_glyph_cache_clear(context->glyph_cache);
++    free(context->glyph_cache);
++    context->glyph_cache = NULL;
++}
++
++static unsigned int d2d_hash_bytes(unsigned int h, const void *data, size_t size)
++{
++    const unsigned char *p = data;
++
++    while (size--)
++        h = (h ^ *p++) * 16777619u;
++    return h;
++}
++
++static unsigned int d2d_glyph_cache_hash(const DWRITE_GLYPH_RUN *run, const float *m, int frac_x, int frac_y,
++        DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
++        DWRITE_TEXT_ANTIALIAS_MODE antialias_mode)
++{
++    unsigned int h = 2166136261u;
++
++    h = d2d_hash_bytes(h, &run->fontFace, sizeof(run->fontFace));
++    h = d2d_hash_bytes(h, &run->fontEmSize, sizeof(run->fontEmSize));
++    h = d2d_hash_bytes(h, &run->glyphCount, sizeof(run->glyphCount));
++    h = d2d_hash_bytes(h, run->glyphIndices, run->glyphCount * sizeof(*run->glyphIndices));
++    if (run->glyphAdvances)
++        h = d2d_hash_bytes(h, run->glyphAdvances, run->glyphCount * sizeof(*run->glyphAdvances));
++    h = d2d_hash_bytes(h, m, 4 * sizeof(*m));
++    h = d2d_hash_bytes(h, &frac_x, sizeof(frac_x));
++    h = d2d_hash_bytes(h, &frac_y, sizeof(frac_y));
++    h = d2d_hash_bytes(h, &rendering_mode, sizeof(rendering_mode));
++    h = d2d_hash_bytes(h, &measuring_mode, sizeof(measuring_mode));
++    h = d2d_hash_bytes(h, &antialias_mode, sizeof(antialias_mode));
++    return h;
++}
++
++static BOOL d2d_glyph_cache_entry_matches(const struct d2d_glyph_cache_entry *e, unsigned int hash,
++        const DWRITE_GLYPH_RUN *run, const float *m, int frac_x, int frac_y, DWRITE_RENDERING_MODE rendering_mode,
++        DWRITE_MEASURING_MODE measuring_mode, DWRITE_TEXT_ANTIALIAS_MODE antialias_mode)
++{
++    if (e->hash != hash || e->font_face != run->fontFace || e->em_size != run->fontEmSize
++            || e->sideways != run->isSideways || e->bidi_level != run->bidiLevel || e->count != run->glyphCount
++            || memcmp(e->m, m, sizeof(e->m)) || e->frac_x != frac_x || e->frac_y != frac_y
++            || e->rendering_mode != rendering_mode || e->measuring_mode != measuring_mode
++            || e->antialias_mode != antialias_mode)
++        return FALSE;
++    if (memcmp(e->indices, run->glyphIndices, run->glyphCount * sizeof(*run->glyphIndices)))
++        return FALSE;
++    if (!e->advances != !run->glyphAdvances
++            || (run->glyphAdvances && memcmp(e->advances, run->glyphAdvances, run->glyphCount * sizeof(float))))
++        return FALSE;
++    if (!e->offsets != !run->glyphOffsets || (run->glyphOffsets
++            && memcmp(e->offsets, run->glyphOffsets, run->glyphCount * sizeof(*run->glyphOffsets))))
++        return FALSE;
++    return TRUE;
++}
++
++static void d2d_glyph_cache_add(struct d2d_device_context *context, unsigned int hash, const DWRITE_GLYPH_RUN *run,
++        const float *m, int frac_x, int frac_y, DWRITE_RENDERING_MODE rendering_mode,
++        DWRITE_MEASURING_MODE measuring_mode, DWRITE_TEXT_ANTIALIAS_MODE antialias_mode,
++        ID2D1Bitmap *bitmap, const RECT *bounds)
++{
++    struct d2d_glyph_cache *cache = context->glyph_cache;
++    struct d2d_glyph_cache_entry *e;
++    UINT32 n = run->glyphCount;
++
++    if (cache->entry_count >= D2D_GLYPH_CACHE_MAX_ENTRIES)
++        d2d_glyph_cache_clear(cache);
++
++    if (!(e = calloc(1, sizeof(*e))))
++        return;
++    if (!(e->indices = malloc(n * sizeof(*e->indices)))
++            || (run->glyphAdvances && !(e->advances = malloc(n * sizeof(*e->advances))))
++            || (run->glyphOffsets && !(e->offsets = malloc(n * sizeof(*e->offsets)))))
++    {
++        free(e->indices);
++        free(e->advances);
++        free(e->offsets);
++        free(e);
++        return;
++    }
++    memcpy(e->indices, run->glyphIndices, n * sizeof(*e->indices));
++    if (run->glyphAdvances)
++        memcpy(e->advances, run->glyphAdvances, n * sizeof(*e->advances));
++    if (run->glyphOffsets)
++        memcpy(e->offsets, run->glyphOffsets, n * sizeof(*e->offsets));
++    e->hash = hash;
++    e->font_face = run->fontFace;
++    IDWriteFontFace_AddRef(e->font_face);
++    e->em_size = run->fontEmSize;
++    e->sideways = run->isSideways;
++    e->bidi_level = run->bidiLevel;
++    e->count = n;
++    memcpy(e->m, m, sizeof(e->m));
++    e->frac_x = frac_x;
++    e->frac_y = frac_y;
++    e->rendering_mode = rendering_mode;
++    e->measuring_mode = measuring_mode;
++    e->antialias_mode = antialias_mode;
++    if ((e->bitmap = bitmap))
++        ID2D1Bitmap_AddRef(bitmap);
++    e->bounds = *bounds;
++    e->next = cache->buckets[hash % D2D_GLYPH_CACHE_BUCKETS];
++    cache->buckets[hash % D2D_GLYPH_CACHE_BUCKETS] = e;
++    ++cache->entry_count;
++}
++
+ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *context,
+         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush,
+         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
+@@ -1406,27 +2247,27 @@
+ {
+     ID2D1RectangleGeometry *geometry = NULL;
+     ID2D1BitmapBrush *opacity_brush = NULL;
++    IDWriteGlyphRunAnalysis *analysis = NULL;
++    struct d2d_glyph_cache_entry *cached;
+     D2D1_BITMAP_PROPERTIES bitmap_desc;
+     ID2D1Bitmap *opacity_bitmap = NULL;
+-    IDWriteGlyphRunAnalysis *analysis;
+     DWRITE_TEXTURE_TYPE texture_type;
+     D2D1_BRUSH_PROPERTIES brush_desc;
+     IDWriteFactory2 *dwrite_factory;
+     D2D1_MATRIX_3X2_F *transform, m;
++    int origin_x, origin_y, frac_x, frac_y;
+     void *opacity_values = NULL;
++    float scale_x, scale_y, ox, oy;
+     size_t opacity_values_size;
+     D2D1_SIZE_U bitmap_size;
+-    float scale_x, scale_y;
+     D2D1_RECT_F run_rect;
++    unsigned int hash;
++    float key_m[4];
+     RECT bounds;
+     HRESULT hr;
+ 
+-    if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+-            &IID_IDWriteFactory2, (IUnknown **)&dwrite_factory)))
+-    {
+-        ERR("Failed to create dwrite factory, hr %#lx.\n", hr);
++    if (!context->glyph_cache && !(context->glyph_cache = calloc(1, sizeof(*context->glyph_cache))))
+         return;
+-    }
+ 
+     transform = &context->drawing_state.transform;
+ 
+@@ -1440,6 +2281,61 @@
+     m._22 = transform->_22 * scale_y;
+     m._32 = transform->_32 * scale_y;
+ 
++    /* Snap the device-space origin to a quarter pixel, so cached bitmaps can be reused at any
++     * integer offset. */
++    ox = baseline_origin.x * m._11 + baseline_origin.y * m._21 + m._31;
++    oy = baseline_origin.x * m._12 + baseline_origin.y * m._22 + m._32;
++    origin_x = (int)floorf(ox);
++    origin_y = (int)floorf(oy);
++    frac_x = min((int)((ox - origin_x) * 4.0f), 3);
++    frac_y = 0;
++    m._31 += origin_x + (frac_x + 0.5f) / 4.0f - ox;
++    origin_y = (int)floorf(oy + 0.5f);
++    m._32 += origin_y - oy;
++
++    key_m[0] = m._11;
++    key_m[1] = m._12;
++    key_m[2] = m._21;
++    key_m[3] = m._22;
++    hash = d2d_glyph_cache_hash(glyph_run, key_m, frac_x, frac_y, rendering_mode, measuring_mode, antialias_mode);
++    for (cached = context->glyph_cache->buckets[hash % D2D_GLYPH_CACHE_BUCKETS]; cached; cached = cached->next)
++    {
++        if (d2d_glyph_cache_entry_matches(cached, hash, glyph_run, key_m, frac_x, frac_y,
++                rendering_mode, measuring_mode, antialias_mode))
++            break;
++    }
++
++    if (cached)
++    {
++        if (!(opacity_bitmap = cached->bitmap))
++            return;
++        ID2D1Bitmap_AddRef(opacity_bitmap);
++        SetRect(&bounds, cached->bounds.left + origin_x, cached->bounds.top + origin_y,
++                cached->bounds.right + origin_x, cached->bounds.bottom + origin_y);
++        goto draw;
++    }
++
++    if (rendering_mode != DWRITE_RENDERING_MODE_ALIASED
++            && d2d_rasterize_glyph_run(glyph_run, baseline_origin, &m, measuring_mode, (BYTE **)&opacity_values, &bounds))
++    {
++        texture_type = DWRITE_TEXTURE_ALIASED_1x1;
++        d2d_size_set(&bitmap_size, bounds.right - bounds.left, bounds.bottom - bounds.top);
++        if (!opacity_values)
++        {
++            d2d_glyph_cache_add(context, hash, glyph_run, key_m, frac_x, frac_y, rendering_mode, measuring_mode,
++                    antialias_mode, NULL, &bounds);
++            return;
++        }
++        goto create_bitmap;
++    }
++
++    if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
++            &IID_IDWriteFactory2, (IUnknown **)&dwrite_factory)))
++    {
++        ERR("Failed to create dwrite factory, hr %#lx.\n", hr);
++        return;
++    }
++
+     hr = IDWriteFactory2_CreateGlyphRunAnalysis(dwrite_factory, glyph_run, (DWRITE_MATRIX *)&m,
+             rendering_mode, measuring_mode, DWRITE_GRID_FIT_MODE_DEFAULT, antialias_mode,
+             baseline_origin.x, baseline_origin.y, &analysis);
+@@ -1465,6 +2361,8 @@
+     if (!bitmap_size.width || !bitmap_size.height)
+     {
+         /* Empty run, nothing to do. */
++        d2d_glyph_cache_add(context, hash, glyph_run, key_m, frac_x, frac_y, rendering_mode, measuring_mode,
++                antialias_mode, NULL, &bounds);
+         goto done;
+     }
+ 
+@@ -1484,6 +2382,7 @@
+         goto done;
+     }
+ 
++create_bitmap:
+     bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
+     bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+     bitmap_desc.dpiX = context->desc.dpiX;
+@@ -1497,6 +2396,15 @@
+         goto done;
+     }
+ 
++    {
++        RECT rel;
++
++        SetRect(&rel, bounds.left - origin_x, bounds.top - origin_y, bounds.right - origin_x, bounds.bottom - origin_y);
++        d2d_glyph_cache_add(context, hash, glyph_run, key_m, frac_x, frac_y, rendering_mode, measuring_mode,
++                antialias_mode, opacity_bitmap, &rel);
++    }
++
++draw:
+     d2d_rect_set(&run_rect, bounds.left / scale_x, bounds.top / scale_y,
+             bounds.right / scale_x, bounds.bottom / scale_y);
+ 
+@@ -1534,7 +2442,8 @@
+     if (opacity_bitmap)
+         ID2D1Bitmap_Release(opacity_bitmap);
+     free(opacity_values);
+-    IDWriteGlyphRunAnalysis_Release(analysis);
++    if (analysis)
++        IDWriteGlyphRunAnalysis_Release(analysis);
+ }
+ 
+ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context,
+@@ -1617,7 +2526,14 @@
+ 
+     if (rendering_mode == DWRITE_RENDERING_MODE_DEFAULT)
+     {
+-        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, glyph_run->fontEmSize,
++        /* Account for the transform scale, so small on-screen text drawn with a large em size
++         * and a scaling transform isn't rendered as outlines. */
++        const D2D1_MATRIX_3X2_F *t = &context->drawing_state.transform;
++        float em_size = glyph_run->fontEmSize, scale = sqrtf(fabsf(t->_11 * t->_22 - t->_12 * t->_21));
++
++        if (scale > 0.0f)
++            em_size *= scale;
++        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, em_size,
+                 max(context->desc.dpiX, context->desc.dpiY) / 96.0f,
+                 measuring_mode, rendering_params, &rendering_mode)))
+         {
+@@ -1796,6 +2712,8 @@
+ 
+     FIXME("iface %p, tag1 %p, tag2 %p stub!\n", iface, tag1, tag2);
+ 
++    d2d_device_restore_app_state(context->device);
++
+     if (context->ops && context->ops->device_context_present)
+         context->ops->device_context_present(context->outer_unknown);
+ 
+@@ -2014,6 +2932,8 @@
+     if (tag2)
+         *tag2 = context->error.tag2;
+ 
++    d2d_device_restore_app_state(context->device);
++
+     if (context->ops && context->ops->device_context_present)
+     {
+         if (FAILED(hr = context->ops->device_context_present(context->outer_unknown)))
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3359,11 +3359,42 @@
+     geometry->u.path.segment_count += bezier_count;
+ }
+ 
++/* A point on an ellipse with radii rx, ry rotated by (cos_phi, sin_phi) around (cx, cy), at parameter
++ * angle t, and the derivative there. */
++static D2D1_POINT_2F d2d_arc_point(float cx, float cy, float rx, float ry, float cos_phi, float sin_phi, float t)
++{
++    D2D1_POINT_2F p;
++
++    p.x = cx + rx * cosf(t) * cos_phi - ry * sinf(t) * sin_phi;
++    p.y = cy + rx * cosf(t) * sin_phi + ry * sinf(t) * cos_phi;
++    return p;
++}
++
++static D2D1_POINT_2F d2d_arc_tangent(float rx, float ry, float cos_phi, float sin_phi, float t)
++{
++    D2D1_POINT_2F d;
++
++    d.x = -rx * sinf(t) * cos_phi - ry * cosf(t) * sin_phi;
++    d.y = -rx * sinf(t) * sin_phi + ry * cosf(t) * cos_phi;
++    return d;
++}
++
++/* Elliptical arc from the figure's current point to arc->point, as up to four cubic Béziers of at
++ * most 90° each. The endpoint parameterization is converted to centre and angles as in SVG 1.1,
++ * appendix F.6.5/F.6.6 (radii too small for the endpoints are scaled up). With y pointing down, a
++ * clockwise sweep is an increasing angle. */
+ static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface, const D2D1_ARC_SEGMENT *arc)
+ {
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
++    float rx, ry, phi, cos_phi, sin_phi, dx2, dy2, x1p, y1p, lambda, num, den, f, cxp, cyp, cx, cy;
++    float t1, dt, k;
++    D2D1_BEZIER_SEGMENT beziers[4];
++    D2D1_POINT_2F p0, p1, a, b, da, db;
++    struct d2d_figure *figure;
++    BOOL large, clockwise;
++    unsigned int n, i;
+ 
+-    FIXME("iface %p, arc %p stub!\n", iface, arc);
++    TRACE("iface %p, arc %p.\n", iface, arc);
+ 
+     if (geometry->u.path.state != D2D_GEOMETRY_STATE_FIGURE)
+     {
+@@ -3371,13 +3402,84 @@
+         return;
+     }
+ 
+-    if (!d2d_figure_add_vertex(&geometry->u.path.figures[geometry->u.path.figure_count - 1], arc->point))
++    figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
++    p0 = figure->vertices[figure->vertex_count - 1];
++    p1 = arc->point;
++    rx = fabsf(arc->size.width);
++    ry = fabsf(arc->size.height);
++    ++geometry->u.path.segment_count;
++
++    if (p0.x == p1.x && p0.y == p1.y)
++        return;
++    if (rx == 0.0f || ry == 0.0f)
+     {
+-        ERR("Failed to add vertex.\n");
++        if (!d2d_figure_add_vertex(figure, p1))
++        {
++            ERR("Failed to add vertex.\n");
++            d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
++        }
+         return;
+     }
+ 
+-    ++geometry->u.path.segment_count;
++    large = arc->arcSize == D2D1_ARC_SIZE_LARGE;
++    clockwise = arc->sweepDirection == D2D1_SWEEP_DIRECTION_CLOCKWISE;
++    phi = arc->rotationAngle * (float)M_PI / 180.0f;
++    cos_phi = cosf(phi);
++    sin_phi = sinf(phi);
++
++    /* the midpoint between the endpoints, in the ellipse's own axes */
++    dx2 = (p0.x - p1.x) / 2.0f;
++    dy2 = (p0.y - p1.y) / 2.0f;
++    x1p = cos_phi * dx2 + sin_phi * dy2;
++    y1p = -sin_phi * dx2 + cos_phi * dy2;
++
++    if ((lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)) > 1.0f)
++    {
++        rx *= sqrtf(lambda);
++        ry *= sqrtf(lambda);
++    }
++
++    num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
++    den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
++    f = (num > 0.0f && den > 0.0f) ? sqrtf(num / den) : 0.0f;
++    if (large == clockwise)
++        f = -f;
++    cxp = f * rx * y1p / ry;
++    cyp = -f * ry * x1p / rx;
++    cx = cos_phi * cxp - sin_phi * cyp + (p0.x + p1.x) / 2.0f;
++    cy = sin_phi * cxp + cos_phi * cyp + (p0.y + p1.y) / 2.0f;
++
++    t1 = atan2f((y1p - cyp) / ry, (x1p - cxp) / rx);
++    dt = atan2f((-y1p - cyp) / ry, (-x1p - cxp) / rx) - t1;
++    if (clockwise && dt < 0.0f)
++        dt += 2.0f * (float)M_PI;
++    else if (!clockwise && dt > 0.0f)
++        dt -= 2.0f * (float)M_PI;
++
++    n = ceilf(fabsf(dt) / ((float)M_PI / 2.0f) - 1e-4f);
++    n = max(1, min(n, 4));
++    dt /= n;
++    k = 4.0f / 3.0f * tanf(dt / 4.0f);
++
++    for (i = 0; i < n; ++i)
++    {
++        a = d2d_arc_point(cx, cy, rx, ry, cos_phi, sin_phi, t1 + i * dt);
++        b = d2d_arc_point(cx, cy, rx, ry, cos_phi, sin_phi, t1 + (i + 1) * dt);
++        da = d2d_arc_tangent(rx, ry, cos_phi, sin_phi, t1 + i * dt);
++        db = d2d_arc_tangent(rx, ry, cos_phi, sin_phi, t1 + (i + 1) * dt);
++        beziers[i].point1.x = a.x + k * da.x;
++        beziers[i].point1.y = a.y + k * da.y;
++        beziers[i].point2.x = b.x - k * db.x;
++        beziers[i].point2.y = b.y - k * db.y;
++        beziers[i].point3 = b;
++    }
++    beziers[n - 1].point3 = p1;     /* exactly the requested end point */
++
++    if (!d2d_figure_add_beziers(figure, beziers, n))
++    {
++        ERR("Failed to add Bézier curves.\n");
++        d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
++    }
+ }
+ 
+ static const struct ID2D1GeometrySinkVtbl d2d_geometry_sink_vtbl =

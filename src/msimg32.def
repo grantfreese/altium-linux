@@ -1,0 +1,7 @@
+; SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-2.1-or-later
+LIBRARY msimg32.dll
+EXPORTS
+    AlphaBlend=shim_AlphaBlend
+    GradientFill=gdi32.GdiGradientFill
+    TransparentBlt=gdi32.GdiTransparentBlt
+    vSetDdrawflag

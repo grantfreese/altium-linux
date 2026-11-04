@@ -1,0 +1,7 @@
+*.dll
+exported-user-data/
+*.new
+offline-cache/
+__pycache__/
+
+settings.yml

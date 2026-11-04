@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-2.1-or-later
+# File types opened with Altium. Columns (tab-separated):
+#   MIME type   icon file in AD21\System\DocumentIcons   description   extensions (space-separated)
+# application/x-gerber and application/vnd.gerber already exist (KiCad, shared-mime-info); the
+# Altium Gerber extensions are added to application/x-gerber.
+application/x-altium-prjpcb	PcbProject.ico	Altium PCB project	PrjPcb
+application/x-altium-prjgrp	ProjectGroup.ico	Altium project group	PrjGrp
+application/x-altium-dsnwrk	ProjectGroup.ico	Altium design workspace	DsnWrk
+application/x-altium-prjmbd	SystemDesign.ico	Altium multi-board project	PrjMbd
+application/x-altium-prjscr	ScriptProject.ico	Altium script project	PrjScr
+application/x-altium-libpkg	IntegratedLibrary.ico	Altium library package	LibPkg
+application/x-altium-schdoc	Sch.ico	Altium schematic	SchDoc
+application/x-altium-pcbdoc	Pcb.ico	Altium PCB	PcbDoc
+application/x-altium-pcbdwf	Draftsman.ico	Altium Draftsman drawing	PcbDwf
+application/x-altium-mbsdoc	SystemDesigner.ico	Altium multi-board schematic	MbsDoc
+application/x-altium-mbadoc	MultiBoardAssembly.ico	Altium multi-board assembly	MbaDoc
+application/x-altium-outjob	ICON_JobManager.ico	Altium output job	OutJob
+application/x-altium-bomdoc	BOM.ico	Altium ActiveBOM document	BomDoc
+application/x-altium-stackup	Pcb.ico	Altium layer stack	Stackup
+application/x-altium-schlib	SchLib.ico	Altium schematic library	SchLib
+application/x-altium-pcblib	PcbLib.ico	Altium PCB library	PcbLib
+application/x-altium-intlib	IntegratedLibrary.ico	Altium integrated library	IntLib
+application/x-altium-dblib	ICON_DatabaseLib.ico	Altium database library	DbLib
+application/x-altium-svndblib	SVNDatabaseLib.ico	Altium SVN database library	SvnDBLib
+application/x-altium-dblink	ICON_DatabaseLink.ico	Altium database link	DBLink
+application/x-altium-cmplib	CmpLib.ico	Altium component library	CmpLib
+application/x-altium-schdot	SchTemplate.ico	Altium schematic template	SchDot
+application/x-altium-dwfdot	DraftsmanTemplate.ico	Altium Draftsman document template	DwfDot
+application/x-altium-dwsdot	DraftsmanTemplate.ico	Altium Draftsman sheet template	DwsDot
+application/x-gerber	CAMtastic.ico	Gerber file	GBR GTL GBL GTO GBO GTS GBS GTP GBP GKO GPT GPB GD1 GDD GDG GG1 GGG G1 G2 G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15 G16 G17 G18 G19 G20 G21 G22 G23 G24 G25 G26 G27 G28 G29 G30 GM1 GM2 GM3 GM4 GM5 GM6 GM7 GM8 GM9 GM10 GM11 GM12 GM13 GM14 GM15 GM16 GP1 GP2 GP3 GP4 GP5 GP6 GP7 GP8 GP9 GP10 GP11 GP12 GP13 GP14 GP15 GP16
+application/vnd.gerber	CAMtastic.ico	Gerber file	GBR
