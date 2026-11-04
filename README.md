@@ -1,5 +1,7 @@
 # altium-linux
 
+**Not affiliated with, endorsed by or supported by Altium.**
+
 Setup script for Altium Designer on Linux under Wine. Run with no arguments for interactive mode:
 
     ./setup.sh
@@ -89,4 +91,4 @@ Required apt packages:
   xdg-utils shared-mime-info gcc make flex bison pkg-config gcc-mingw-w64-x86-64 fonts-open-sans
   fonts-dejavu-core fonts-liberation fonts-liberation-sans-narrow fonts-noto-core fonts-noto-cjk
 
-GPL-2.0-or-later OR LGPL-2.1-or-later. Not affiliated with Altium.
+GPL-2.0-or-later OR LGPL-2.1-or-later.
